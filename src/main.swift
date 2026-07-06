@@ -30,11 +30,11 @@ class DockMinimizeManager {
     private var thumbnailCache: [String: NSImage] = [:]
     
     func start() {
-        print("[DockMinimize v3.7] Initializing Warning-Free AppKit Engine...")
+        print("[DockMinimize v3.8] Initializing Isolated Pre-Flight Engine...")
         
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         guard AXIsProcessTrustedWithOptions(options as CFDictionary) else {
-            print("[DockMinimize v3.7] CRITICAL: Accessibility permissions missing.")
+            print("[DockMinimize v3.8] CRITICAL: Accessibility permissions missing.")
             return
         }
         
@@ -52,7 +52,7 @@ class DockMinimizeManager {
                     let location = event.location
                     if manager.evaluateClickSynchronously(at: location) {
                         manager.shouldSwallowNextMouseUp = true
-                        return nil // Swallow original click event
+                        return nil // Swallow original click event because a valid app was matched
                     }
                 } else if type == .leftMouseUp {
                     if manager.shouldSwallowNextMouseUp {
@@ -65,7 +65,7 @@ class DockMinimizeManager {
             },
             userInfo: nil
         ) else {
-            print("[DockMinimize v3.7] ERROR: Failed to create event tap.")
+            print("[DockMinimize v3.8] ERROR: Failed to create event tap.")
             return
         }
         
@@ -73,7 +73,7 @@ class DockMinimizeManager {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
         
-        print("[DockMinimize v3.7] Pure On-Demand Engine operational.")
+        print("[DockMinimize v3.8] Pure On-Demand Engine operational.")
     }
     
     private func evaluateClickSynchronously(at location: CGPoint) -> Bool {
@@ -84,20 +84,12 @@ class DockMinimizeManager {
         
         var pid: pid_t = 0
         AXUIElementGetPid(element, &pid)
-        let clickedApp = NSRunningApplication(processIdentifier: pid)
+        guard let clickedApp = NSRunningApplication(processIdentifier: pid) else { return false }
+        let bid = clickedApp.bundleIdentifier ?? ""
         
-        if clickedApp?.bundleIdentifier == "com.apple.dock" {
-            Task { @MainActor in
-                await self.processDockClickAsync(element: element)
-            }
-            return true
-        }
+        // Accept both Dock handles and direct Finder UI layer reports
+        guard bid == "com.apple.dock" || bid == "com.apple.finder" else { return false }
         
-        Task { @MainActor in self.dismissPreviewPanel() }
-        return false
-    }
-    
-    private func processDockClickAsync(element: AXUIElement) async {
         var titleValue: AnyObject?
         AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleValue)
         var appName = titleValue as? String ?? ""
@@ -112,9 +104,42 @@ class DockMinimizeManager {
             }
         }
         
-        var targetPid: pid_t = 0
-        var childrenValue: AnyObject?
+        // ARCHITECTURAL UPDATE: Strict Verification Guards for Finder Interactions
+        if bid == "com.apple.finder" {
+            var roleVal: AnyObject?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleVal)
+            let role = roleVal as? String ?? ""
+            
+            // 1. Role Guard: The Finder Dock tile specifically exposes an AXDockItem or AXButton.
+            // If the user clicks the Desktop wallpaper (AXScrollArea/AXWindow) or Desktop files (AXIcon), drop out instantly.
+            guard role == "AXDockItem" || role == "AXButton" else {
+                return false
+            }
+            
+            // 2. Identity Guard: Ensure the application description target actually maps to Finder.
+            // This stops our app from hijacking standard control buttons inside active Finder folders.
+            guard appName.localizedCaseInsensitiveContains("Finder") else {
+                return false
+            }
+        }
         
+        // Pre-flight check handles folder stacks (like "Apps") cleanly without swallowing native system triggers
+        guard let targetApp = resolveTargetProcess(for: element, appName: appName, bid: bid) else {
+            return false
+        }
+        
+        Task { @MainActor in
+            await self.executeDockActionAsync(targetApp: targetApp, dockElement: element)
+        }
+        return true
+    }
+    
+    private func resolveTargetProcess(for element: AXUIElement, appName: String, bid: String) -> NSRunningApplication? {
+        if bid == "com.apple.finder" || appName == "Finder" {
+            return NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.finder" })
+        }
+        
+        var childrenValue: AnyObject?
         if AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &childrenValue) == .success,
            let children = childrenValue as? [AXUIElement] {
             for child in children {
@@ -123,15 +148,14 @@ class DockMinimizeManager {
                 if childPid != 0, let candidateApp = NSRunningApplication(processIdentifier: childPid),
                    candidateApp.bundleIdentifier != "com.apple.dock",
                    candidateApp.activationPolicy == .regular {
-                    targetPid = childPid
-                    break
+                    return candidateApp
                 }
             }
         }
         
         let apps = NSWorkspace.shared.runningApplications
         
-        if targetPid == 0 && !appName.isEmpty {
+        if !appName.isEmpty {
             if let targetApp = apps.first(where: { 
                 $0.activationPolicy == .regular && (
                     $0.localizedName == appName ||
@@ -139,35 +163,34 @@ class DockMinimizeManager {
                     appName.localizedCaseInsensitiveContains($0.localizedName ?? "") == true
                 )
             }) {
-                targetPid = targetApp.processIdentifier
+                return targetApp
             }
         }
         
-        if targetPid == 0 {
-            if !appName.isEmpty, let targetApp = apps.first(where: {
+        if !appName.isEmpty {
+            if let targetApp = apps.first(where: {
                 $0.activationPolicy == .regular && $0.bundleIdentifier?.localizedCaseInsensitiveContains(appName) == true
             }) {
-                targetPid = targetApp.processIdentifier
-            } else if appName.isEmpty {
-                if let targetApp = apps.first(where: { $0.activationPolicy == .regular && $0.bundleIdentifier?.localizedCaseInsensitiveContains("iterm") == true }) {
-                    targetPid = targetApp.processIdentifier
-                }
+                return targetApp
+            }
+        } else {
+            if let targetApp = apps.first(where: { $0.activationPolicy == .regular && $0.bundleIdentifier?.localizedCaseInsensitiveContains("iterm") == true }) {
+                return targetApp
             }
         }
         
-        guard targetPid != 0, let targetApp = NSRunningApplication(processIdentifier: targetPid) else { 
-            print("[DockMinimize v3.7] Target application unidentified for name: '\(appName)'")
-            return 
-        }
-        
+        return nil
+    }
+    
+    private func executeDockActionAsync(targetApp: NSRunningApplication, dockElement: AXUIElement) async {
+        let targetPid = targetApp.processIdentifier
         let bundleId = targetApp.bundleIdentifier ?? ""
         let appRef = AXUIElementCreateApplication(targetPid)
         var windowListValue: AnyObject?
         
-        // OPTIMIZATION: Replacing deprecated options with modern cooperative activation alternatives
         guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowListValue) == .success,
               let windows = windowListValue as? [AXUIElement], !windows.isEmpty else {
-            print("[DockMinimize v3.7] Empty window matrix for \(targetApp.localizedName ?? "App"). Triggering Safety Valve Toggle.")
+            print("[DockMinimize v3.8] Empty window matrix for \(targetApp.localizedName ?? "App"). Triggering Safety Valve Toggle.")
             if !targetApp.isActive {
                 targetApp.activate(options: .activateAllWindows)
                 AXUIElementSetAttributeValue(appRef, kAXHiddenAttribute as CFString, kCFBooleanFalse)
@@ -202,7 +225,7 @@ class DockMinimizeManager {
                 lastClickedBundleId = bundleId
             }
         } else {
-            await showCustomMiniaturePanel(for: targetApp, dockElement: element, axWindows: windows)
+            await showCustomMiniaturePanel(for: targetApp, dockElement: dockElement, axWindows: windows)
             lastClickedBundleId = bundleId
         }
     }
