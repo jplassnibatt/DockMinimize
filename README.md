@@ -46,7 +46,7 @@ $ xcode-select --install
 ## Build and install
 
 ```code
-$ git clone https://github.com/jlassnibatt/DockMinimize.git
+$ git clone https://github.com/jplassnibatt/DockMinimize.git
 $ cd DockMinimize
 $ chmod u+x package.sh
 $ ./package.sh         # This will install the application in the Applications folder

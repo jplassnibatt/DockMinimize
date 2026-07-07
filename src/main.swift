@@ -17,6 +17,7 @@ class DockMinimizeManager {
     
     private var lastClickedBundleId: String? = nil
     private var currentPreviewPanel: NSPanel? = nil
+    private var lastClickTime = Date()
     
     // Thread-safe state bridge for the low-level event tap callback
     private let stateLock = NSLock()
@@ -30,11 +31,11 @@ class DockMinimizeManager {
     private var thumbnailCache: [String: NSImage] = [:]
     
     func start() {
-        print("[DockMinimize v3.8] Initializing Isolated Pre-Flight Engine...")
+        print("[DockMinimize v3.9] Initializing Bulletproof Loop Engine...")
         
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         guard AXIsProcessTrustedWithOptions(options as CFDictionary) else {
-            print("[DockMinimize v3.8] CRITICAL: Accessibility permissions missing.")
+            print("[DockMinimize v3.9] CRITICAL: Accessibility permissions missing.")
             return
         }
         
@@ -52,7 +53,7 @@ class DockMinimizeManager {
                     let location = event.location
                     if manager.evaluateClickSynchronously(at: location) {
                         manager.shouldSwallowNextMouseUp = true
-                        return nil // Swallow original click event because a valid app was matched
+                        return nil // Swallow original click event when handling minimization or custom restoration
                     }
                 } else if type == .leftMouseUp {
                     if manager.shouldSwallowNextMouseUp {
@@ -65,7 +66,7 @@ class DockMinimizeManager {
             },
             userInfo: nil
         ) else {
-            print("[DockMinimize v3.8] ERROR: Failed to create event tap.")
+            print("[DockMinimize v3.9] ERROR: Failed to create event tap.")
             return
         }
         
@@ -73,7 +74,7 @@ class DockMinimizeManager {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
         
-        print("[DockMinimize v3.8] Pure On-Demand Engine operational.")
+        print("[DockMinimize v3.9] Pure On-Demand Engine operational.")
     }
     
     private func evaluateClickSynchronously(at location: CGPoint) -> Bool {
@@ -85,10 +86,9 @@ class DockMinimizeManager {
         var pid: pid_t = 0
         AXUIElementGetPid(element, &pid)
         guard let clickedApp = NSRunningApplication(processIdentifier: pid) else { return false }
-        let bid = clickedApp.bundleIdentifier ?? ""
         
-        // Accept both Dock handles and direct Finder UI layer reports
-        guard bid == "com.apple.dock" || bid == "com.apple.finder" else { return false }
+        // STRICT PROCESS PERIMETER FIREWALL: Isolate execution strictly to com.apple.dock.
+        guard clickedApp.bundleIdentifier == "com.apple.dock" else { return false }
         
         var titleValue: AnyObject?
         AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleValue)
@@ -104,38 +104,135 @@ class DockMinimizeManager {
             }
         }
         
-        // ARCHITECTURAL UPDATE: Strict Verification Guards for Finder Interactions
-        if bid == "com.apple.finder" {
-            var roleVal: AnyObject?
-            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &roleVal)
-            let role = roleVal as? String ?? ""
-            
-            // 1. Role Guard: The Finder Dock tile specifically exposes an AXDockItem or AXButton.
-            // If the user clicks the Desktop wallpaper (AXScrollArea/AXWindow) or Desktop files (AXIcon), drop out instantly.
-            guard role == "AXDockItem" || role == "AXButton" else {
-                return false
-            }
-            
-            // 2. Identity Guard: Ensure the application description target actually maps to Finder.
-            // This stops our app from hijacking standard control buttons inside active Finder folders.
-            guard appName.localizedCaseInsensitiveContains("Finder") else {
-                return false
-            }
+        guard let targetApp = resolveTargetProcess(for: element, appName: appName) else {
+            return false // Let folder stacks (like "Apps") and the Trash process natively via macOS
         }
         
-        // Pre-flight check handles folder stacks (like "Apps") cleanly without swallowing native system triggers
-        guard let targetApp = resolveTargetProcess(for: element, appName: appName, bid: bid) else {
+        let targetPid = targetApp.processIdentifier
+        let bundleId = targetApp.bundleIdentifier ?? ""
+        
+        // =========================================================================
+        // PURE FINDER AUTOMATION ENGINE (DETERMINISTIC INFINITE LOOP TOGGLE)
+        // =========================================================================
+        if bundleId == "com.apple.finder" {
+            let scriptSource = """
+            tell application "Finder"
+                try
+                    if (count of Finder windows) is 0 then
+                        return "native"
+                    end if
+                    
+                    if frontmost is false then
+                        return "native" -- Let the native macOS Dock bring Finder windows to the front
+                    else
+                        if collapsed of Finder window 1 is true then
+                            set collapsed of Finder window 1 to false
+                            activate
+                            return "swallow"
+                        else
+                            set collapsed of Finder window 1 to true
+                            return "swallow"
+                        end if
+                    end if
+                on error
+                    return "native"
+                end try
+            end tell
+            """
+            
+            if let script = NSAppleScript(source: scriptSource) {
+                var error: NSDictionary?
+                let result = script.executeAndReturnError(&error)
+                if let stringResult = result.stringValue, stringResult == "swallow" {
+                    lastClickedBundleId = bundleId
+                    lastClickTime = Date()
+                    return true // Intercepted and toggled Finder window state
+                }
+            }
+            lastClickedBundleId = bundleId
+            lastClickTime = Date()
+            return false // Allow native Dock instantiation/focus adjustments
+        }
+        // =========================================================================
+        
+        let appRef = AXUIElementCreateApplication(targetPid)
+        var windowListValue: AnyObject?
+        
+        guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowListValue) == .success,
+              let rawWindows = windowListValue as? [AXUIElement] else {
             return false
         }
         
-        Task { @MainActor in
-            await self.executeDockActionAsync(targetApp: targetApp, dockElement: element)
+        // Exclude persistent background wallpaper substrate windows to acquire a pure user window layout count
+        let windows = rawWindows.filter { isStandardWindow($0) }
+        
+        // If an app has no windows open, delegate back to the macOS Dock natively to spawn a clean window instance
+        if windows.isEmpty {
+            return false
         }
-        return true
+        
+        // Clear stale preview overlay panels if switching to another multi-window application layout
+        if currentPreviewPanel != nil && lastClickedBundleId != bundleId {
+            Task { @MainActor in self.dismissPreviewPanel() }
+        }
+        
+        // Shortcut: If a multi-window preview pane is currently visible, a subsequent click smooth-minimizes all windows
+        if currentPreviewPanel != nil && lastClickedBundleId == bundleId {
+            Task { @MainActor in
+                for win in windows where !self.isWindowMinimized(win) {
+                    await self.cacheSingleAXWindow(axWindow: win, pid: targetPid)
+                }
+                self.minimizeAllWindows(windows)
+                self.dismissPreviewPanel()
+            }
+            return true
+        }
+        
+        if windows.count == 1 {
+            let singleWindow = windows[0]
+            let isMinimized = isWindowMinimized(singleWindow)
+            
+            // Standard AppKit minimization toggle pipeline for non-Finder apps
+            if targetApp.isActive && !isMinimized {
+                let now = Date()
+                if lastClickedBundleId == bundleId && now.timeIntervalSince(lastClickTime) < 0.4 {
+                    return true 
+                }
+                lastClickTime = now
+                lastClickedBundleId = bundleId
+                
+                Task { @MainActor in
+                    await self.cacheSingleAXWindow(axWindow: singleWindow, pid: targetPid)
+                    self.minimizeWindow(singleWindow)
+                }
+                return true
+            } else {
+                lastClickedBundleId = bundleId
+                lastClickTime = Date()
+                
+                Task { @MainActor in
+                    targetApp.activate(options: .activateAllWindows)
+                    if isMinimized {
+                        AXUIElementSetAttributeValue(singleWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+                        AXUIElementSetAttributeValue(singleWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
+                    }
+                }
+                return isMinimized
+            }
+        } else {
+            // Multi-window matrix: Spawn the custom visual preview matrix overlay panel
+            lastClickedBundleId = bundleId
+            lastClickTime = Date()
+            Task { @MainActor in
+                if self.currentPreviewPanel != nil { self.dismissPreviewPanel() }
+                await self.showCustomMiniaturePanel(for: targetApp, dockElement: element, axWindows: windows)
+            }
+            return true
+        }
     }
     
-    private func resolveTargetProcess(for element: AXUIElement, appName: String, bid: String) -> NSRunningApplication? {
-        if bid == "com.apple.finder" || appName == "Finder" {
+    private func resolveTargetProcess(for element: AXUIElement, appName: String) -> NSRunningApplication? {
+        if appName.localizedCaseInsensitiveContains("Finder") {
             return NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == "com.apple.finder" })
         }
         
@@ -182,52 +279,13 @@ class DockMinimizeManager {
         return nil
     }
     
-    private func executeDockActionAsync(targetApp: NSRunningApplication, dockElement: AXUIElement) async {
-        let targetPid = targetApp.processIdentifier
-        let bundleId = targetApp.bundleIdentifier ?? ""
-        let appRef = AXUIElementCreateApplication(targetPid)
-        var windowListValue: AnyObject?
-        
-        guard AXUIElementCopyAttributeValue(appRef, kAXWindowsAttribute as CFString, &windowListValue) == .success,
-              let windows = windowListValue as? [AXUIElement], !windows.isEmpty else {
-            print("[DockMinimize v3.8] Empty window matrix for \(targetApp.localizedName ?? "App"). Triggering Safety Valve Toggle.")
-            if !targetApp.isActive {
-                targetApp.activate(options: .activateAllWindows)
-                AXUIElementSetAttributeValue(appRef, kAXHiddenAttribute as CFString, kCFBooleanFalse)
-            } else {
-                targetApp.hide()
-                AXUIElementSetAttributeValue(appRef, kAXHiddenAttribute as CFString, kCFBooleanTrue)
-            }
-            dismissPreviewPanel()
-            return
+    fileprivate func isStandardWindow(_ window: AXUIElement) -> Bool {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &value) == .success else { return true }
+        if let subrole = value as? String {
+            return subrole == "AXStandardWindow"
         }
-        
-        if currentPreviewPanel != nil && lastClickedBundleId == bundleId {
-            for win in windows where !isWindowMinimized(win) {
-                await cacheSingleAXWindow(axWindow: win, pid: targetPid)
-            }
-            minimizeAllWindows(windows)
-            dismissPreviewPanel()
-            return
-        }
-        
-        if currentPreviewPanel != nil { dismissPreviewPanel() }
-        
-        if windows.count == 1 {
-            let singleWindow = windows[0]
-            if targetApp.isActive && !isWindowMinimized(singleWindow) {
-                await cacheSingleAXWindow(axWindow: singleWindow, pid: targetPid)
-                minimizeWindow(singleWindow)
-                lastClickedBundleId = bundleId
-            } else {
-                targetApp.activate(options: .activateAllWindows)
-                AXUIElementSetAttributeValue(singleWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-                lastClickedBundleId = bundleId
-            }
-        } else {
-            await showCustomMiniaturePanel(for: targetApp, dockElement: dockElement, axWindows: windows)
-            lastClickedBundleId = bundleId
-        }
+        return true
     }
     
     private func cacheSingleAXWindow(axWindow: AXUIElement, pid: pid_t) async {
@@ -239,7 +297,11 @@ class DockMinimizeManager {
         var axPoint = CGPoint.zero
         if let pVal = posValue { AXValueGetValue(pVal as! AXValue, .cgPoint, &axPoint) }
         
-        if let targetScWindow = scWindows.first(where: { abs($0.frame.origin.x - axPoint.x) < 50 && abs($0.frame.origin.y - axPoint.y) < 50 }) {
+        if let targetScWindow = scWindows.first(where: { window in
+            let deltaX = abs(window.frame.origin.x - axPoint.x)
+            let deltaY = abs(window.frame.origin.y - axPoint.y)
+            return deltaX < 50 && deltaY < 50
+        }) {
             let filter = SCContentFilter(desktopIndependentWindow: targetScWindow)
             let config = SCStreamConfiguration()
             config.width = 280
@@ -292,7 +354,11 @@ class DockMinimizeManager {
             if let pVal = axPosVal { AXValueGetValue(pVal as! AXValue, .cgPoint, &axPoint) }
             
             if !minimized {
-                if let bestMatchIndex = availableSCWindows.firstIndex(where: { abs($0.frame.origin.x - axPoint.x) < 60 && abs($0.frame.origin.y - axPoint.y) < 60 }) {
+                if let bestMatchIndex = availableSCWindows.firstIndex(where: { scWindow in
+                    let deltaX = abs(scWindow.frame.origin.x - axPoint.x)
+                    let deltaY = abs(scWindow.frame.origin.y - axPoint.y)
+                    return deltaX < 60 && deltaY < 60
+                }) {
                     let matchedScWindow = availableSCWindows.remove(at: bestMatchIndex)
                     let filter = SCContentFilter(desktopIndependentWindow: matchedScWindow)
                     let config = SCStreamConfiguration()
@@ -318,14 +384,7 @@ class DockMinimizeManager {
             ))
         }
         
-        guard !previews.isEmpty else {
-            if !app.isActive {
-                app.activate(options: .activateAllWindows)
-            } else {
-                app.hide()
-            }
-            return
-        }
+        guard !previews.isEmpty else { return }
         
         let previewView = PreviewCollectionView(previews: previews) { selectedAxWindow in
             app.activate(options: .activateAllWindows)
