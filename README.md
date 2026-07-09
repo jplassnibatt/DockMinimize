@@ -31,46 +31,44 @@ DockMinimize/
 ```
 ---
 
-## Required Permissions
-
-```text
-Accessibility and ScreenCapture (for miniatures)
-```
-
 ## Requirements to build
 
 ```code
-$ xcode-select --install
+xcode-select --install
 ```
 
 ## Build and install
 
 ```code
-$ git clone https://github.com/jplassnibatt/DockMinimize.git
-$ cd DockMinimize
-$ chmod u+x package.sh
-$ ./package.sh         # This will install the application in the Applications folder
+git clone https://github.com/jplassnibatt/DockMinimize.git
+cd DockMinimize
+./package.sh         # This will install the application in the Applications folder
 ```
 
-## Launch it
+## Required Permissions
+`Accessibility` and `ScreenCapture` (for miniatures).
+
+## Start it
 Double click on the `DockMinimize.app` in the `Applications` folder. Grant permissions when asked. It will run silently in the background. 
+
+## Launch at Startup
+To launch DockMinimize at startup, you can add it to the `System Settings > Login Items > Open at Login` list.
 
 ## Kill application
 If you need to kill the application, you can run the following command:
-
 ```code
-$ killall DockMinimize
+killall DockMinimize
 ```
 
 ## Uninstall
-
 ```code
-$ rm -rf /Applications/DockMinimize.app
+rm -rf /Applications/DockMinimize.app
+or
+Remove it from your Applications folder.
 ```
 ---
 
 ## License
-
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
