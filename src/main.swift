@@ -30,12 +30,15 @@ class DockMinimizeManager {
     // Low-latency in-memory thumbnail storage
     private var thumbnailCache: [String: NSImage] = [:]
     
+    // NEW: Structured Concurrency handle for the 5-second miniature preview auto-dismiss timer
+    private var autoDismissTask: Task<Void, Never>? = nil
+    
     func start() {
-        print("[DockMinimize v3.9] Initializing Bulletproof Loop Engine...")
+        print("[DockMinimize v4.0] Initializing Bulletproof Loop Engine...")
         
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         guard AXIsProcessTrustedWithOptions(options as CFDictionary) else {
-            print("[DockMinimize v3.9] CRITICAL: Accessibility permissions missing.")
+            print("[DockMinimize v4.0] CRITICAL: Accessibility permissions missing.")
             return
         }
         
@@ -66,7 +69,7 @@ class DockMinimizeManager {
             },
             userInfo: nil
         ) else {
-            print("[DockMinimize v3.9] ERROR: Failed to create event tap.")
+            print("[DockMinimize v4.0] ERROR: Failed to create event tap.")
             return
         }
         
@@ -74,7 +77,7 @@ class DockMinimizeManager {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
         
-        print("[DockMinimize v3.9] Pure On-Demand Engine operational.")
+        print("[DockMinimize v4.0] Pure On-Demand Engine operational.")
     }
     
     private func evaluateClickSynchronously(at location: CGPoint) -> Bool {
@@ -418,9 +421,37 @@ class DockMinimizeManager {
         
         panel.orderFrontRegardless()
         self.currentPreviewPanel = panel
+        
+        // =========================================================================
+        // NEW: 5-SECOND AUTO-DISMISS STRUCTURED CONCURRENCY ENGINE
+        // =========================================================================
+        // 1. Cancel any pre-existing timer to prevent race conditions from consecutive clicks
+        autoDismissTask?.cancel()
+        
+        // 2. Start a new 5-second asynchronous countdown on the MainActor
+        autoDismissTask = Task { @MainActor in
+            do {
+                // Sleep for exactly 5 seconds (5,000,000,000 nanoseconds)
+                // If autoDismissTask?.cancel() is called during this sleep, it throws a CancellationError
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                
+                // If we woke up without being cancelled, cleanly dismiss the panel
+                guard !Task.isCancelled else { return }
+                self.dismissPreviewPanel()
+                print("[DockMinimize v4.0] Miniature panel auto-dismissed after 5 seconds of inactivity.")
+            } catch {
+                // Task was cleanly cancelled (e.g., user clicked a window or opened a new preview)
+                // We safely ignore the cancellation error and do nothing.
+            }
+        }
+        // =========================================================================
     }
     
     func dismissPreviewPanel() {
+        // NEW: Cancel any running 5-second countdown when dismissing the panel
+        autoDismissTask?.cancel()
+        autoDismissTask = nil
+        
         if let panel = currentPreviewPanel {
             panel.orderOut(nil)
             currentPreviewPanel = nil
