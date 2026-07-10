@@ -19,7 +19,6 @@ class DockMinimizeManager {
     private var currentPreviewPanel: NSPanel? = nil
     private var lastClickTime = Date()
     
-    // Thread-safe state bridge for the low-level event tap callback
     private let stateLock = NSLock()
     private var _shouldSwallowNextMouseUp = false
     var shouldSwallowNextMouseUp: Bool {
@@ -27,18 +26,16 @@ class DockMinimizeManager {
         set { stateLock.withLock { _shouldSwallowNextMouseUp = newValue } }
     }
     
-    // Low-latency in-memory thumbnail storage
     private var thumbnailCache: [String: NSImage] = [:]
     
-    // NEW: Structured Concurrency handle for the 5-second miniature preview auto-dismiss timer
     private var autoDismissTask: Task<Void, Never>? = nil
     
     func start() {
-        print("[DockMinimize v4.0] Initializing Bulletproof Loop Engine...")
+        print("[DockMinimize v4.1] Initializing Bulletproof Loop Engine...")
         
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
         guard AXIsProcessTrustedWithOptions(options as CFDictionary) else {
-            print("[DockMinimize v4.0] CRITICAL: Accessibility permissions missing.")
+            print("[DockMinimize v4.1] CRITICAL: Accessibility permissions missing.")
             return
         }
         
@@ -56,12 +53,12 @@ class DockMinimizeManager {
                     let location = event.location
                     if manager.evaluateClickSynchronously(at: location) {
                         manager.shouldSwallowNextMouseUp = true
-                        return nil // Swallow original click event when handling minimization or custom restoration
+                        return nil
                     }
                 } else if type == .leftMouseUp {
                     if manager.shouldSwallowNextMouseUp {
                         manager.shouldSwallowNextMouseUp = false
-                        return nil // Swallow paired mouse release
+                        return nil
                     }
                 }
                 
@@ -69,7 +66,7 @@ class DockMinimizeManager {
             },
             userInfo: nil
         ) else {
-            print("[DockMinimize v4.0] ERROR: Failed to create event tap.")
+            print("[DockMinimize v4.1] ERROR: Failed to create event tap.")
             return
         }
         
@@ -77,7 +74,7 @@ class DockMinimizeManager {
         CFRunLoopAddSource(CFRunLoopGetCurrent(), runLoopSource, .commonModes)
         CGEvent.tapEnable(tap: eventTap, enable: true)
         
-        print("[DockMinimize v4.0] Pure On-Demand Engine operational.")
+        print("[DockMinimize v4.1] Pure On-Demand Engine operational.")
     }
     
     private func evaluateClickSynchronously(at location: CGPoint) -> Bool {
@@ -90,7 +87,6 @@ class DockMinimizeManager {
         AXUIElementGetPid(element, &pid)
         guard let clickedApp = NSRunningApplication(processIdentifier: pid) else { return false }
         
-        // STRICT PROCESS PERIMETER FIREWALL: Isolate execution strictly to com.apple.dock.
         guard clickedApp.bundleIdentifier == "com.apple.dock" else { return false }
         
         var titleValue: AnyObject?
@@ -108,15 +104,12 @@ class DockMinimizeManager {
         }
         
         guard let targetApp = resolveTargetProcess(for: element, appName: appName) else {
-            return false // Let folder stacks (like "Apps") and the Trash process natively via macOS
+            return false
         }
         
         let targetPid = targetApp.processIdentifier
         let bundleId = targetApp.bundleIdentifier ?? ""
         
-        // =========================================================================
-        // PURE FINDER AUTOMATION ENGINE (DETERMINISTIC INFINITE LOOP TOGGLE)
-        // =========================================================================
         if bundleId == "com.apple.finder" {
             let scriptSource = """
             tell application "Finder"
@@ -126,7 +119,7 @@ class DockMinimizeManager {
                     end if
                     
                     if frontmost is false then
-                        return "native" -- Let the native macOS Dock bring Finder windows to the front
+                        return "native"
                     else
                         if collapsed of Finder window 1 is true then
                             set collapsed of Finder window 1 to false
@@ -149,14 +142,13 @@ class DockMinimizeManager {
                 if let stringResult = result.stringValue, stringResult == "swallow" {
                     lastClickedBundleId = bundleId
                     lastClickTime = Date()
-                    return true // Intercepted and toggled Finder window state
+                    return true
                 }
             }
             lastClickedBundleId = bundleId
             lastClickTime = Date()
-            return false // Allow native Dock instantiation/focus adjustments
+            return false
         }
-        // =========================================================================
         
         let appRef = AXUIElementCreateApplication(targetPid)
         var windowListValue: AnyObject?
@@ -166,20 +158,17 @@ class DockMinimizeManager {
             return false
         }
         
-        // Exclude persistent background wallpaper substrate windows to acquire a pure user window layout count
+        // Exclude persistent background wallpaper substrate windows via our upgraded standard filter
         let windows = rawWindows.filter { isStandardWindow($0) }
         
-        // If an app has no windows open, delegate back to the macOS Dock natively to spawn a clean window instance
         if windows.isEmpty {
             return false
         }
         
-        // Clear stale preview overlay panels if switching to another multi-window application layout
         if currentPreviewPanel != nil && lastClickedBundleId != bundleId {
             Task { @MainActor in self.dismissPreviewPanel() }
         }
         
-        // Shortcut: If a multi-window preview pane is currently visible, a subsequent click smooth-minimizes all windows
         if currentPreviewPanel != nil && lastClickedBundleId == bundleId {
             Task { @MainActor in
                 for win in windows where !self.isWindowMinimized(win) {
@@ -195,7 +184,6 @@ class DockMinimizeManager {
             let singleWindow = windows[0]
             let isMinimized = isWindowMinimized(singleWindow)
             
-            // Standard AppKit minimization toggle pipeline for non-Finder apps
             if targetApp.isActive && !isMinimized {
                 let now = Date()
                 if lastClickedBundleId == bundleId && now.timeIntervalSince(lastClickTime) < 0.4 {
@@ -217,13 +205,14 @@ class DockMinimizeManager {
                     targetApp.activate(options: .activateAllWindows)
                     if isMinimized {
                         AXUIElementSetAttributeValue(singleWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+                        // NEW: Explicitly perform the HIG Raise Action to force Custom UI Apps (Zoom) to render context
+                        AXUIElementPerformAction(singleWindow, kAXRaiseAction as CFString)
                         AXUIElementSetAttributeValue(singleWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
                     }
                 }
                 return isMinimized
             }
         } else {
-            // Multi-window matrix: Spawn the custom visual preview matrix overlay panel
             lastClickedBundleId = bundleId
             lastClickTime = Date()
             Task { @MainActor in
@@ -283,10 +272,32 @@ class DockMinimizeManager {
     }
     
     fileprivate func isStandardWindow(_ window: AXUIElement) -> Bool {
+        // =========================================================================
+        // NEW: ROBUST SUBSTRATE SIZE FILTER
+        // Zoom and Electron apps spawn invisible 1x1 or 0x0 overlay windows for tooltips.
+        // We must filter these out based on geometric size to avoid polluting the preview pane.
+        // =========================================================================
+        var sizeValue: AnyObject?
+        if AXUIElementCopyAttributeValue(window, kAXSizeAttribute as CFString, &sizeValue) == .success,
+           let sVal = sizeValue {
+            var size = CGSize.zero
+            if CFGetTypeID(sVal) == AXValueGetTypeID() {
+                AXValueGetValue(sVal as! AXValue, .cgSize, &size)
+                if size.width < 50 || size.height < 50 { return false }
+            }
+        }
+        
+        // =========================================================================
+        // NEW: BROADENED AXSUBROLE EVALUATION
+        // Zoom drops the "AXStandardWindow" subrole and downgrades meeting windows
+        // to "AXDialog" or "AXDocumentPanel" when minimized or manipulated.
+        // =========================================================================
         var value: AnyObject?
         guard AXUIElementCopyAttributeValue(window, kAXSubroleAttribute as CFString, &value) == .success else { return true }
+        
         if let subrole = value as? String {
-            return subrole == "AXStandardWindow"
+            let validSubroles = ["AXStandardWindow", "AXDialog", "AXDocumentPanel"]
+            return validSubroles.contains(subrole)
         }
         return true
     }
@@ -392,6 +403,8 @@ class DockMinimizeManager {
         let previewView = PreviewCollectionView(previews: previews) { selectedAxWindow in
             app.activate(options: .activateAllWindows)
             AXUIElementSetAttributeValue(selectedAxWindow, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
+            // NEW: Explicit HIG Window Raise to combat Custom UI render drops
+            AXUIElementPerformAction(selectedAxWindow, kAXRaiseAction as CFString)
             AXUIElementSetAttributeValue(selectedAxWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
             self.dismissPreviewPanel()
         }
@@ -422,33 +435,20 @@ class DockMinimizeManager {
         panel.orderFrontRegardless()
         self.currentPreviewPanel = panel
         
-        // =========================================================================
-        // NEW: 5-SECOND AUTO-DISMISS STRUCTURED CONCURRENCY ENGINE
-        // =========================================================================
-        // 1. Cancel any pre-existing timer to prevent race conditions from consecutive clicks
         autoDismissTask?.cancel()
         
-        // 2. Start a new 5-second asynchronous countdown on the MainActor
         autoDismissTask = Task { @MainActor in
             do {
-                // Sleep for exactly 5 seconds (5,000,000,000 nanoseconds)
-                // If autoDismissTask?.cancel() is called during this sleep, it throws a CancellationError
                 try await Task.sleep(nanoseconds: 5_000_000_000)
-                
-                // If we woke up without being cancelled, cleanly dismiss the panel
                 guard !Task.isCancelled else { return }
                 self.dismissPreviewPanel()
-                print("[DockMinimize v4.0] Miniature panel auto-dismissed after 5 seconds of inactivity.")
+                print("[DockMinimize v4.1] Miniature panel auto-dismissed after 5 seconds of inactivity.")
             } catch {
-                // Task was cleanly cancelled (e.g., user clicked a window or opened a new preview)
-                // We safely ignore the cancellation error and do nothing.
             }
         }
-        // =========================================================================
     }
     
     func dismissPreviewPanel() {
-        // NEW: Cancel any running 5-second countdown when dismissing the panel
         autoDismissTask?.cancel()
         autoDismissTask = nil
         
